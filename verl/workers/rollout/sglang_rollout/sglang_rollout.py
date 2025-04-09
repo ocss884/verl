@@ -146,15 +146,18 @@ class SGLangRollout(BaseRollout):
         visible_devices_set = set(visible_devices)
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
 
-        nnodes = -(-tp_size // len(visible_devices_set))
-        server_args = ServerArgs(model_path=actor_module, nnodes=nnodes)
-        ip, port_args = get_ip(), PortArgs.init_new(server_args)
-        [ip, port_args] = broadcast_pyobj([ip, port_args],
-                                          rank=tp_rank,
-                                          dist_group=device_mesh_cpu.get_group("tp"),
-                                          src=device_mesh_cpu["tp"].mesh[0].item())
-        dist_init_addr = f"{ip}:{port_args.nccl_port}"
-
+        if (nnodes := -(-tp_size // len(visible_devices_set))) > 1:
+            server_args = ServerArgs(model_path=actor_module, nnodes=nnodes)
+            ip, port_args = get_ip(), PortArgs.init_new(server_args)
+            [ip, port_args] = broadcast_pyobj([ip, port_args],
+                                            rank=tp_rank,
+                                            dist_group=device_mesh_cpu.get_group("tp"),
+                                            src=device_mesh_cpu["tp"].mesh[0].item())
+            dist_init_addr = f"{ip}:{port_args.nccl_port}"
+        else:
+            dist_init_addr = None
+        
+        print(f"{dist_init_addr=}")
         self.inference_engine = VerlEngine(
             model_path=actor_module,
             dtype=config.dtype,
