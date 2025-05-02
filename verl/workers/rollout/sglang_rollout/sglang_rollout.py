@@ -29,15 +29,18 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
+import tempfile
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch.distributed
 from omegaconf import DictConfig
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import broadcast_pyobj, get_ip, get_open_port
+from sglang.srt.server_args import PortArgs
+from sglang.srt.utils import broadcast_pyobj, configure_ipv6, get_ip, get_open_port
 from tensordict import TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
@@ -48,6 +51,8 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.net_utils import is_ipv6
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
+
+ZMQ_TCP_PORT_DELTA = 233
 
 if TYPE_CHECKING:
     from torch import nn
@@ -185,6 +190,7 @@ class SGLangRollout(BaseRollout):
             gpu_id_step=1,
             load_format=load_format,
             dist_init_addr=dist_init_addr,
+            port=30000 + int(os.environ["RANK"]),
             nnodes=nnodes,
             # NOTE(Chenyang): if you want to debug the sglang engine
             # please set the following parameters
@@ -322,14 +328,14 @@ class SGLangRollout(BaseRollout):
             )
 
             out = _post_process_outputs(self.tokenizer, output)
-    
+
             response = out[0].to(idx.device)
             # log_probs = out[1].to(idx.device)
-    
+
             if response.shape[1] < self.config.response_length:
                 response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
                 # log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
-    
+
             # utilize current sampling params
             if self.sampling_params.get("n", 1) > 1 and do_sample:
                 idx = idx.repeat_interleave(self.sampling_params["n"], dim=0)
@@ -389,18 +395,14 @@ class SGLangRollout(BaseRollout):
     def offload(self):
         self.inference_engine.release_memory_occupation()
 
-import socket
-from typing import List, Optional
-import tempfile
-from sglang.srt.utils import configure_ipv6
-ZMQ_TCP_PORT_DELTA = 233
-def custom_find_port(server_args,dp_rank: Optional[int] = None) -> "PortArgs":
+
+def custom_find_port(server_args, dp_rank: Optional[int] = None) -> PortArgs:
     def _get_free_port():
         with socket.socket() as sock:
             sock.bind(("", 0))
             return sock.getsockname()[1]
-    
-    port =_get_free_port()
+
+    port = _get_free_port()
 
     if not server_args.enable_dp_attention:
         # Normal case, use IPC within a single node
@@ -421,16 +423,12 @@ def custom_find_port(server_args,dp_rank: Optional[int] = None) -> "PortArgs":
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
 
-        assert (
-            len(dist_init_addr) == 2
-        ), "please provide --dist-init-addr as host:port of head node"
+        assert len(dist_init_addr) == 2, "please provide --dist-init-addr as host:port of head node"
 
         dist_init_host, dist_init_port = dist_init_addr
         port_base = int(dist_init_port) + 1
         if dp_rank is None:
-            scheduler_input_port = (
-                port_base + 3
-            )  # TokenizerManager to DataParallelController
+            scheduler_input_port = port_base + 3  # TokenizerManager to DataParallelController
         else:
             scheduler_input_port = port_base + 3 + 1 + dp_rank
 
